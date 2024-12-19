@@ -1,0 +1,81 @@
+trigger:
+  - feature
+
+pool:
+  name: robotech-self-hosted
+
+variables:
+  azureSubscription: 'Free Trial(26)(6b56c47e-45f7-4ef7-912c-e2f6ee545e78)'
+  resourceGroup: 'practicedemo-resourcegroup'
+  aksCluster: 'practicedemo-cluster'
+  acrName: 'practicedemoacr'
+  imageName: 'web-game'
+  namespace: 'dev'
+  environment: 'dev-environment' # Define the environment name
+
+stages:
+  - stage: BuildAndPush
+    displayName: "Build and Push Docker Image"
+    jobs:
+      - job: Build
+        displayName: "Build Docker Image"
+        steps:
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: $(azureSubscription)
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                set -e
+                echo "Building Docker image..."
+                docker build -t $(acrName).azurecr.io/$(imageName):$(Build.BuildId) 2048-game
+                echo "Logging into ACR..."
+                az acr login -n $(acrName)
+                echo "Pushing Docker image..."
+                docker push $(acrName).azurecr.io/$(imageName):$(Build.BuildId)
+                echo "Docker image pushed successfully."
+                echo "Updating image tag in Kubernetes manifest..."
+                if [[ "$OSTYPE" == "darwin"* || "$OSTYPE" == "linux-gnu"* ]]; then
+                  sed -i "s|image: .*|image: $(acrName).azurecr.io/$(imageName):$(Build.BuildId)|" 01_kubernetes_aks/app-deploy.yaml
+                else
+                  sed -i.bak "s|image: .*|image: $(acrName).azurecr.io/$(imageName):$(Build.BuildId)|" 01_kubernetes_aks/app-deploy.yaml
+
+  - stage: Deploy
+    displayName: "Deploy to Kubernetes"
+    dependsOn: BuildAndPush
+    jobs:
+      - deployment: DeployToKubernetes
+        displayName: "Deploy to Kubernetes Cluster"
+        environment: $(environment)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - script: |
+                    set -e
+                    echo "Creating namespace if it doesn't exist..."
+                    kubectl get namespace $(namespace) || kubectl create namespace $(namespace)
+                  displayName: "Ensure Namespace Exists"
+
+                - script: |
+                    set -e
+                    echo "Validating Kubernetes manifest..."
+                    kubectl apply -f 01_kubernetes_aks/app-deploy.yaml --dry-run=client --validate=true
+                  displayName: "Validate Kubernetes YAML"
+
+                - task: Kubernetes@1
+                  displayName: 'Deploy Kubernetes manifests'
+                  inputs:
+                    connectionType: 'Azure Resource Manager'
+                    azureSubscriptionEndpoint: $(azureSubscription)
+                    azureResourceGroup: $(resourceGroup)
+                    kubernetesCluster: $(aksCluster)
+                    namespace: $(namespace)
+                    command: 'apply'
+                    useConfigurationFile: true
+                    configuration: '01_kubernetes_aks/app-deploy.yaml'
+                    secretType: 'dockerRegistry'
+                    containerRegistryType: 'Azure Container Registry'
+                    azureSubscriptionEndpointForSecrets: $(azureSubscription)
+                    azureContainerRegistry: '$(acrName).azurecr.io'
+                    forceUpdate: false
